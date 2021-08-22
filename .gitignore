@@ -1,0 +1,10 @@
+.ionide
+paket-files
+**/bin/
+**/obj/
+logs/
+out/
+.fake
+.vs
+.idea
+.paket
