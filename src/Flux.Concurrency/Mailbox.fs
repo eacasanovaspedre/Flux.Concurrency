@@ -7,10 +7,10 @@ open Hopac.Infixes
 type 'T MailboxProcessor = private MailboxProcessor of 'T Mailbox
 
 [<Struct>]
-type 'T MailboxProcessorStop = private MailboxProcessorStop of 'T Mailbox * unit IVar
+type MailboxProcessorStop<'T, 'S> = private MailboxProcessorStop of 'T Mailbox * 'S IVar
 
-type 'T MsgOrStop =
-    | Stop of unit
+type MsgOrStop<'T,'S> =
+    | Stop of 'S
     | Msg of 'T
 
 module MailboxProcessor =
@@ -59,4 +59,4 @@ module MailboxProcessorStop =
             replyIVar |> msgBuilder |> Mailbox.send mailbox
             >>-. IVar.read replyIVar
 
-    let stop (MailboxProcessorStop (_, stopIVar)) = IVar.tryFill stopIVar ()
+    let stop (MailboxProcessorStop (_, stopIVar)) v = IVar.tryFill stopIVar v
