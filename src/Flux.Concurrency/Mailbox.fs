@@ -4,12 +4,13 @@ open Hopac
 open Hopac.Infixes
 
 [<Struct>]
-type 'T MailboxProcessor = private MailboxProcessor of 'T Mailbox
+type 'T MailboxProcessor = private MailboxProcessor of Mailbox: 'T Mailbox
 
-[<Struct>]
-type MailboxProcessorStop<'T, 'S> = private MailboxProcessorStop of 'T Mailbox * 'S IVar
+type MailboxProcessorStop<'T, 'Stop> = private MailboxProcessorStop of Mailbox: 'T Mailbox * Stopped: 'Stop IVar
 
-type MsgOrStop<'T,'S> =
+exception CannotSendToMailboxProcessorStoppingException of StopValue: obj
+
+type MsgOrStop<'T, 'S> =
     | Stop of 'S
     | Msg of 'T
 
@@ -41,22 +42,50 @@ module MailboxProcessorStop =
         let stopIVar = IVar()
 
         let inline takeMsg () =
-            (Mailbox.take mailbox ^-> Msg)
-            <|> (stopIVar ^-> Stop)
+            (stopIVar ^-> Stop)
+            <|> (Mailbox.take mailbox ^-> Msg)
 
         takeMsg |> agent |> Promise.start
         >>- fun stopped ->
                 {| Mailbox = MailboxProcessorStop(mailbox, stopIVar)
                    Stopped = stopped |}
 
-    let send (MailboxProcessorStop (mailbox, _)) msg = Mailbox.send mailbox msg
+    let trySend (MailboxProcessorStop (mailbox, stop)) msg =
+        (stop ^-> Error)
+        <|> (Alt.prepare
+             <| (Mailbox.send mailbox msg >>-. Alt.always (Ok())))
 
-    let sendAndAwaitReply (MailboxProcessorStop (mailbox, _)) msgBuilder =
-        Alt.prepareJob
-        <| fun _ ->
-            let replyIVar = IVar()
+    let maybeSend mailboxProcessor msg =
+        trySend mailboxProcessor msg
+        >>- function
+            | Ok _ -> Some()
+            | Error _ -> None
 
-            replyIVar |> msgBuilder |> Mailbox.send mailbox
-            >>-. IVar.read replyIVar
+    let send mailboxProcessor msg =
+        trySend mailboxProcessor msg
+        >>- function
+            | Ok _ -> ()
+            | Error x -> raise (CannotSendToMailboxProcessorStoppingException x)
+
+    let trySendAndAwaitReply (MailboxProcessorStop (mailbox, stop)) msgBuilder =
+        (stop ^-> Error)
+        <|> (Alt.prepareJob
+             <| fun _ ->
+                 let replyIVar = IVar()
+
+                 replyIVar |> msgBuilder |> Mailbox.send mailbox
+                 >>-. IVar.read replyIVar ^-> Ok)
+
+    let maybeSendAndAwaitReply mailboxProcessor msgBuilder =
+        trySendAndAwaitReply mailboxProcessor msgBuilder
+        >>- function
+            | Ok x -> Some x
+            | Error x -> None
+
+    let sendAndAwaitReply mailboxProcessor msgBuilder =
+        trySendAndAwaitReply mailboxProcessor msgBuilder
+        >>- function
+            | Ok x -> x
+            | Error x -> raise (CannotSendToMailboxProcessorStoppingException x)
 
     let stop (MailboxProcessorStop (_, stopIVar)) v = IVar.tryFill stopIVar v
