@@ -1,6 +1,6 @@
 STORAGE: NONE
 NUGET
   remote: https://www.nuget.org/api/v2
-    FSharp.Core (5.0.2)
+    FSharp.Core (8.0.301)
     Hopac (0.5.1)
       FSharp.Core (>= 4.5.2) - restriction: >= netstandard2.0
