@@ -12,8 +12,9 @@ module MailboxAgent =
     let create agent =
         let mailbox = Mailbox ()
         let inline takeMsg () = Mailbox.take mailbox
+        let inline sendMsg msg = Mailbox.send mailbox (msg, None)
 
-        takeMsg |> agent |> Promise.start
+        (takeMsg, sendMsg) ||> agent |> Promise.start
         >>- fun stopped -> MailboxAgent (mailbox, stopped)
 
     let send (MailboxAgent (mailbox, _)) msg = Mailbox.send mailbox (msg, None)
@@ -49,10 +50,10 @@ module MailboxAgentStop =
     let create agent =
         let mailbox = Mailbox ()
         let stopIVar = IVar ()
-
         let inline takeMsg () = stopIVar ^-> Stop <|> Mailbox.take mailbox ^-> Msg
+        let inline sendMsg msg = Mailbox.send mailbox (msg, None)
 
-        takeMsg |> agent |> Promise.start
+        (takeMsg, sendMsg) ||> agent |> Promise.start
         >>- fun stopped -> MailboxAgentStop (mailbox, stopped, stopIVar)
 
     let trySend (MailboxAgentStop (mailbox, _, stop)) msg =
