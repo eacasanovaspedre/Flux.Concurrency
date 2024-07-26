@@ -6,6 +6,64 @@ open Hopac.Infixes
 
 type NackOption = unit Promise option
 
+type 'Letter LetterSender = ('Letter -> unit Job) -> unit Job
+type 'Letter LetterCmd = 'Letter LetterSender list
+
+module internal LetterSender =
+    let inline internal create f : 'Letter LetterSender = f
+
+    let inline map (f: 'Letter -> 'NewLetter) (letterSender: 'Letter LetterSender) =
+        create <| fun send -> letterSender (f >> send)
+
+module LetterCmd =
+    let inline create list : 'Letter LetterCmd = list
+
+    let none: 'Letter LetterCmd = []
+
+    let inline ofLetter (letter: 'Letter) = create [ LetterSender.create <| fun send -> send letter ]
+
+    let inline ofLetterJob (letterJob: 'Letter Job) = create [ LetterSender.create <| fun send -> letterJob >>= send ]
+
+    let inline ofLetterOption (letterOption: 'Letter option) =
+        create
+            [ LetterSender.create
+              <| fun send -> letterOption |> Option.map send |> Option.defaultWith Job.unit ]
+
+    let inline ofLetterOptionJob (letterOptionJob: 'Letter option Job) =
+        create
+            [ LetterSender.create
+              <| fun send -> letterOptionJob >>= (Option.map send >> Option.defaultWith Job.unit) ]
+
+    let inline ofLetters (letters: #seq<'Letter>) =
+        create [ LetterSender.create <| fun send -> letters |> Seq.Con.iterJob send ]
+
+    let inline ofLetterOptions (letterOptions: #seq<'Letter option>) =
+        create
+            [ LetterSender.create
+              <| fun send ->
+                  letterOptions
+                  |> Seq.Con.iterJob (Option.map send >> Option.defaultWith Job.unit) ]
+
+    let inline ofLetterJobs (letterJobs: #seq<#Job<'Letter>>) =
+        create [ LetterSender.create <| fun send -> letterJobs |> Seq.Con.iterJob (Job.bind send) ]
+
+    let inline ofLetterOptionJobs (letterOptionJobs: #seq<#Job<'Letter option>>) =
+        create
+            [ LetterSender.create
+              <| fun send ->
+                  letterOptionJobs
+                  |> Seq.Con.iterJob (Job.bind (Option.map send >> Option.defaultWith Job.unit)) ]
+
+    let inline ofAnyJob anyJob = create [ LetterSender.create <| fun send -> anyJob |> Job.Ignore ]
+
+    let inline batch (letterCmds: #seq<'Letter LetterCmd>) = letterCmds |> List.concat |> create
+
+    let inline map (f: 'Letter -> 'NewLetter) (letterCmd: 'Letter LetterCmd) =
+        letterCmd |> List.map (LetterSender.map f) |> create
+
+    let inline internal exec send (letterCmd: 'Letter LetterCmd) =
+        letterCmd |> Seq.Con.iterJob (fun sender -> sender send) |> Job.queue
+
 type MailboxAgent<'Letter, 'StoppedToken, 'StopToken> =
     private
         { Mailbox: Mailbox<'Letter * NackOption>
@@ -21,64 +79,6 @@ module MailboxAgent =
     type LetterOrStop<'Letter, 'StopToken> =
         | Stop of 'StopToken
         | Letter of 'Letter * NackOption
-
-    type 'Letter LetterSender = ('Letter -> unit Job) -> unit Job
-    type 'Letter LetterCmd = 'Letter LetterSender list
-
-    module internal LetterSender =
-        let inline internal create f : 'Letter LetterSender = f
-
-        let inline map (f: 'Letter -> 'NewLetter) (letterSender: 'Letter LetterSender) =
-            create <| fun send -> letterSender (f >> send)
-
-    module LetterCmd =
-        let inline create list : 'Letter LetterCmd = list
-
-        let none: 'Letter LetterCmd = []
-
-        let inline ofLetter (letter: 'Letter) = create [ LetterSender.create <| fun send -> send letter ]
-
-        let inline ofLetterJob (letterJob: 'Letter Job) =
-            create [ LetterSender.create <| fun send -> letterJob >>= send ]
-
-        let inline ofLetterOption (letterOption: 'Letter option) =
-            create
-                [ LetterSender.create
-                  <| fun send -> letterOption |> Option.map send |> Option.defaultWith Job.unit ]
-
-        let inline ofLetterOptionJob (letterOptionJob: 'Letter option Job) =
-            create
-                [ LetterSender.create
-                  <| fun send -> letterOptionJob >>= (Option.map send >> Option.defaultWith Job.unit) ]
-
-        let inline ofLetters (letters: #seq<'Letter>) =
-            create [ LetterSender.create <| fun send -> letters |> Seq.Con.iterJob send ]
-
-        let inline ofLetterOptions (letterOptions: #seq<'Letter option>) =
-            create
-                [ LetterSender.create <| fun send ->
-                      letterOptions
-                      |> Seq.Con.iterJob (Option.map send >> Option.defaultWith Job.unit) ]
-
-        let inline ofLetterJobs (letterJobs: #seq<#Job<'Letter>>) =
-            create [ LetterSender.create <| fun send -> letterJobs |> Seq.Con.iterJob (Job.bind send) ]
-
-        let inline ofLetterOptionJobs (letterOptionJobs: #seq<#Job<'Letter option>>) =
-            create
-                [ LetterSender.create
-                  <| fun send ->
-                      letterOptionJobs
-                      |> Seq.Con.iterJob (Job.bind (Option.map send >> Option.defaultWith Job.unit)) ]
-
-        let inline ofAnyJob anyJob = create [ LetterSender.create <| fun send -> anyJob |> Job.Ignore ]
-
-        let inline batch (letterCmds: #seq<'Letter LetterCmd>) = letterCmds |> List.concat |> create
-
-        let inline map (f: 'Letter -> 'NewLetter) (letterCmd: 'Letter LetterCmd) =
-            letterCmd |> List.map (LetterSender.map f) |> create
-
-        let inline internal exec send (letterCmd: 'Letter LetterCmd) =
-            letterCmd |> Seq.Con.iterJob (fun sender -> sender send) |> Job.queue
 
     module Create =
         open Hopac
