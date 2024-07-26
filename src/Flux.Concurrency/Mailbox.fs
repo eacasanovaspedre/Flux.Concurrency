@@ -52,22 +52,25 @@ module MailboxAgent =
                   <| fun send -> letterOptionJob >>= (Option.map send >> Option.defaultWith Job.unit) ]
 
         let inline ofLetters (letters: #seq<'Letter>) =
-            create [ LetterSender.create (fun send -> letters |> Seq.Con.iterJob send) ]
+            create [ LetterSender.create <| fun send -> letters |> Seq.Con.iterJob send ]
 
         let inline ofLetterOptions (letterOptions: #seq<'Letter option>) =
             create
-                [ LetterSender.create (fun send ->
+                [ LetterSender.create <| fun send ->
                       letterOptions
-                      |> Seq.Con.iterJob (Option.map send >> Option.defaultWith Job.unit)) ]
+                      |> Seq.Con.iterJob (Option.map send >> Option.defaultWith Job.unit) ]
 
         let inline ofLetterJobs (letterJobs: #seq<#Job<'Letter>>) =
-            create [ LetterSender.create (fun send -> letterJobs |> Seq.Con.iterJob (Job.bind send)) ]
+            create [ LetterSender.create <| fun send -> letterJobs |> Seq.Con.iterJob (Job.bind send) ]
 
         let inline ofLetterOptionJobs (letterOptionJobs: #seq<#Job<'Letter option>>) =
             create
-                [ LetterSender.create (fun send ->
+                [ LetterSender.create
+                  <| fun send ->
                       letterOptionJobs
-                      |> Seq.Con.iterJob (Job.bind (Option.map send >> Option.defaultWith Job.unit))) ]
+                      |> Seq.Con.iterJob (Job.bind (Option.map send >> Option.defaultWith Job.unit)) ]
+
+        let inline ofAnyJob anyJob = create [ LetterSender.create <| fun send -> anyJob |> Job.Ignore ]
 
         let inline batch (letterCmds: #seq<'Letter LetterCmd>) = letterCmds |> List.concat |> create
 
