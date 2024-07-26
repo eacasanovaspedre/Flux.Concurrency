@@ -96,7 +96,7 @@ module MailboxAgent =
                   Stop = stopIVar }
 
         let ofUpdateWithCmds
-            (stop: 'StopToken -> Job<'StoppedToken>)
+            (stop: 'StopToken -> 'State -> Job<'StoppedToken>)
             (init: unit -> Job<'State>)
             (update: NackOption -> 'Letter -> 'State -> 'State * LetterCmd<'Letter>)
             =
@@ -106,7 +106,7 @@ module MailboxAgent =
                     take ()
                     >>= fun msg ->
                         match msg with
-                        | Stop token -> stop token
+                        | Stop token -> stop token state
                         | Letter (body, nackOption) ->
                             let state', cmd = update nackOption body state
 
@@ -115,7 +115,7 @@ module MailboxAgent =
                 init () >>= loop
 
         let ofUpdateWithIntents
-            (stop: 'StopToken -> Job<'StoppedToken>)
+            (stop: 'StopToken -> 'State -> Job<'StoppedToken>)
             (init: unit -> Job<'State>)
             (update: NackOption -> 'Letter -> 'State -> 'State * 'Intent list)
             mapIntents
@@ -126,7 +126,7 @@ module MailboxAgent =
                     take ()
                     >>= fun msg ->
                         match msg with
-                        | Stop token -> stop token
+                        | Stop token -> stop token state
                         | Letter (body, nackOption) ->
                             let state', intents = update nackOption body state
 
@@ -138,7 +138,7 @@ module MailboxAgent =
         module State =
             let ofUpdateWithCmds
                 (runState: '``StateMonad<'State, LetterCmd<'Letter>>`` -> 'State -> LetterCmd<'Letter> * 'State)
-                (stop: 'StopToken -> Job<'StoppedToken>)
+                (stop: 'StopToken -> 'State -> Job<'StoppedToken>)
                 (init: unit -> Job<'State>)
                 (update: NackOption -> 'Letter -> _)
                 =
@@ -148,7 +148,7 @@ module MailboxAgent =
                         take ()
                         >>= fun msg ->
                             match msg with
-                            | Stop token -> stop token
+                            | Stop token -> stop token state
                             | Letter (body, nackOption) ->
                                 let cmd, state' = runState (update nackOption body) state
 
@@ -158,7 +158,7 @@ module MailboxAgent =
 
             let ofUpdateWithIntents
                 (runState: '``StateMonad<'State, 'Intent list>`` -> 'State -> 'Intent list * 'State)
-                (stop: 'StopToken -> Job<'StoppedToken>)
+                (stop: 'StopToken -> 'State -> Job<'StoppedToken>)
                 (init: unit -> Job<'State>)
                 (update: NackOption -> 'Letter -> _)
                 mapIntent
@@ -169,7 +169,7 @@ module MailboxAgent =
                         take ()
                         >>= fun msg ->
                             match msg with
-                            | Stop token -> stop token
+                            | Stop token -> stop token state
                             | Letter (body, nackOption) ->
                                 let intents, state' = runState (update nackOption body) state
 
