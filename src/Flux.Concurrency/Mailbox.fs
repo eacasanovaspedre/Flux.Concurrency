@@ -3,60 +3,94 @@
 open Hopac
 open Hopac.Infixes
 
+type NackOption = unit Promise option
+
 [<Struct>]
-type MailboxAgent<'T, 'StoppedToken> =
-    private | MailboxAgent of Mailbox: Mailbox<'T * unit Promise option> * Stopped: 'StoppedToken Alt
+type MailboxAgent<'T, 'StoppedToken, 'StopToken> =
+    private | MailboxAgent of Mailbox: Mailbox<'T * NackOption> * Stopped: 'StoppedToken Alt * Stop: 'StopToken IVar
 
 module MailboxAgent =
-
-    let create agent =
-        let mailbox = Mailbox ()
-        let inline takeMsg () = Mailbox.take mailbox
-        let inline sendMsg msg = Mailbox.send mailbox (msg, None)
-
-        (takeMsg, sendMsg) ||> agent |> Promise.start
-        >>- fun stopped -> MailboxAgent (mailbox, stopped)
-
-    let send (MailboxAgent (mailbox, _)) msg = Mailbox.send mailbox (msg, None)
-
-    let sendAndAwaitReply (MailboxAgent (mailbox, stopped)) msgBuilder =
-        Alt.withNackJob
-        <| fun nack ->
-            let replyIVar = IVar ()
-
-            (msgBuilder replyIVar, Some nack) |> Mailbox.send mailbox >>-. replyIVar
-
-    let stopped (MailboxAgent (_, stopped)) = stopped
-
-    let isStopped (MailboxAgent (_, stopped)) = stopped ^->. true <|> Alt.always false
-
-[<Struct>]
-type MailboxAgentStop<'T, 'StoppedToken, 'StopToken> =
-    private | MailboxAgentStop of
-        Mailbox: Mailbox<'T * unit Promise option> *
-        Stopped: 'StoppedToken Alt *
-        Stop: 'StopToken IVar
-
-module MailboxAgentStop =
 
     type CouldNotSendLetter<'StopToken> = AgentStopping of 'StopToken
 
     exception CouldNotSendLetterException of Error: obj CouldNotSendLetter
 
-    type LetterOrStop<'T, 'S> =
-        | Stop of 'S
-        | Msg of 'T
+    type LetterOrStop<'T, 'StopToken> =
+        | Stop of 'StopToken
+        | Letter of 'T * NackOption
+
+    type LetterCmd<'T> = 'T option Job list
+
+    module LetterCmd =
+
+        let none: _ LetterCmd = []
+
+        let inline ofLetterOption letterOption : _ LetterCmd = [ Job.result letterOption ]
+
+        let inline ofLetter letter : _ LetterCmd = ofLetterOption (Some letter)
+
+        let inline ofLetterJob letterJob : _ LetterCmd = [ letterJob >>- Some ]
+
+        let inline ofLetterOptionJob letterOptionJob : _ LetterCmd = [ letterOptionJob ]
+
+        let inline ofJobAny anyJob : _ LetterCmd = anyJob >>-. None |> ofLetterOptionJob
+
+        let inline batch (letterCmds: #seq<'Letter LetterCmd>) : 'Letter LetterCmd = List.concat letterCmds
+
+        let runWith run (letterCmd: _ LetterCmd) =
+            letterCmd
+            |> Seq.map (Job.bind (Option.map run >> Option.defaultWith Job.unit))
+            |> Job.conIgnore
+            |> Job.queue
 
     let create agent =
         let mailbox = Mailbox ()
         let stopIVar = IVar ()
-        let inline takeMsg () = stopIVar ^-> Stop <|> Mailbox.take mailbox ^-> Msg
+        let inline takeMsg () = stopIVar ^-> Stop <|> Mailbox.take mailbox ^-> Letter
         let inline sendMsg msg = Mailbox.send mailbox (msg, None)
 
         (takeMsg, sendMsg) ||> agent |> Promise.start
-        >>- fun stopped -> MailboxAgentStop (mailbox, stopped, stopIVar)
+        >>- fun stopped -> MailboxAgent (mailbox, stopped, stopIVar)
 
-    let trySend (MailboxAgentStop (mailbox, _, stop)) msg =
+    module WithUpdate =
+
+        let create init update stop =
+            create
+            <| fun take send ->
+                let rec loop state =
+                    take ()
+                    >>= fun msg ->
+                        match msg with
+                        | Stop token -> stop token
+                        | Letter (body, nackOption) ->
+                            let state', cmds = update nackOption body state
+
+                            cmds
+                            |> Seq.map (Job.bind send)
+                            |> Job.conIgnore
+                            |> Job.queue
+                            >>= fun () -> loop state'
+
+                init () >>= loop
+
+    module WithIntents =
+
+        let create init update mapIntents stop =
+            create
+            <| fun take send ->
+                let rec loop state =
+                    take ()
+                    >>= fun msg ->
+                        match msg with
+                        | Stop token -> stop token
+                        | Letter (body, nackOption) ->
+                            let state', cmd = update nackOption body state
+
+                            LetterCmd.runWith send cmd >>=. loop state'
+
+                init () >>= loop
+
+    let trySend (MailboxAgent (mailbox, _, stop)) msg =
         stop ^-> (Error << AgentStopping)
         <|> Alt.prepare (Mailbox.send mailbox (msg, None) >>-. Alt.always (Ok ()))
         |> asJob
@@ -75,7 +109,7 @@ module MailboxAgentStop =
                 match error with
                 | AgentStopping token -> token |> box |> AgentStopping |> CouldNotSendLetterException |> raise
 
-    let trySendAndAwaitReply (MailboxAgentStop (mailbox, _, stop)) msgBuilder =
+    let trySendAndAwaitReply (MailboxAgent (mailbox, _, stop)) msgBuilder =
         stop ^-> (Error << AgentStopping)
         <|> (Alt.withNackJob
              <| fun nack ->
@@ -97,15 +131,14 @@ module MailboxAgentStop =
                 match error with
                 | AgentStopping token -> token |> box |> AgentStopping |> CouldNotSendLetterException |> raise
 
-    let sendStop (MailboxAgentStop (_, _, stopIVar)) v = IVar.tryFill stopIVar v
+    let sendStop (MailboxAgent (_, _, stopIVar)) v = IVar.tryFill stopIVar v
 
-    let sendStopAndAwait (MailboxAgentStop (_, stopped, stopIVar)) v =
-        IVar.tryFill stopIVar v >>-. stopped |> Alt.prepare
+    let sendStopAndAwait (MailboxAgent (_, stopped, stopIVar)) v = IVar.tryFill stopIVar v >>-. stopped |> Alt.prepare
 
-    let stopped (MailboxAgentStop (_, stopped, _)) = stopped
+    let stopped (MailboxAgent (_, stopped, _)) = stopped
 
-    let stopping (MailboxAgentStop (_, _, stopping)) = stopping
+    let stopping (MailboxAgent (_, _, stopping)) = stopping
 
-    let isStopped (MailboxAgentStop (_, stopped, _)) = stopped ^->. true <|> Alt.always false
+    let isStopped (MailboxAgent (_, stopped, _)) = stopped ^->. true <|> Alt.always false
 
-    let isStopping (MailboxAgentStop (_, _, stopping)) = stopping ^->. true <|> Alt.always false
+    let isStopping (MailboxAgent (_, _, stopping)) = stopping ^->. true <|> Alt.always false
