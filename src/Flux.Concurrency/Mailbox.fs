@@ -80,24 +80,64 @@ module MailboxAgent =
         | Stop of 'StopToken
         | Letter of 'Letter * NackOption
 
-    module Create =
+    let ofAgentFunc agent : MailboxAgent<'Letter, 'StoppedToken, 'StopToken> Job =
+        let mailbox = Mailbox ()
+        let stopIVar = IVar ()
+        let inline takeMsg () = stopIVar ^-> Stop <|> Mailbox.take mailbox ^-> Letter
+        let inline sendMsg msg = Mailbox.send mailbox (msg, None)
 
-        let ofAgentFunc agent : MailboxAgent<'Letter, 'StoppedToken, 'StopToken> Job =
-            let mailbox = Mailbox ()
-            let stopIVar = IVar ()
-            let inline takeMsg () = stopIVar ^-> Stop <|> Mailbox.take mailbox ^-> Letter
-            let inline sendMsg msg = Mailbox.send mailbox (msg, None)
+        (takeMsg, sendMsg) ||> agent |> Promise.start
+        >>- fun stopped ->
+            { Mailbox = mailbox
+              Stopped = stopped
+              Stop = stopIVar }
 
-            (takeMsg, sendMsg) ||> agent |> Promise.start
-            >>- fun stopped ->
-                { Mailbox = mailbox
-                  Stopped = stopped
-                  Stop = stopIVar }
+    let ofUpdateWithCmds
+        (stop: 'StopToken -> 'State -> #Job<'StoppedToken>)
+        (init: unit -> #Job<'State>)
+        (update: NackOption -> 'Letter -> 'State -> 'State * LetterCmd<'Letter>)
+        =
+        ofAgentFunc
+        <| fun take send ->
+            let rec loop state =
+                take ()
+                >>= fun msg ->
+                    match msg with
+                    | Stop token -> stop token state |> asJob
+                    | Letter (body, nackOption) ->
+                        let state', cmd = update nackOption body state
 
+                        LetterCmd.exec send cmd >>= fun () -> loop state'
+
+            init () >>= loop
+
+    let ofUpdateWithIntents
+        (stop: 'StopToken -> 'State -> #Job<'StoppedToken>)
+        (init: unit -> #Job<'State>)
+        (update: NackOption -> 'Letter -> 'State -> 'State * 'Intent list)
+        mapIntents
+        =
+        ofAgentFunc
+        <| fun take send ->
+            let rec loop state =
+                take ()
+                >>= fun msg ->
+                    match msg with
+                    | Stop token -> stop token state |> asJob
+                    | Letter (body, nackOption) ->
+                        let state', intents = update nackOption body state
+
+                        intents |> Seq.map mapIntents |> LetterCmd.batch |> LetterCmd.exec send
+                        >>=. loop state'
+
+            init () >>= loop
+
+    module State =
         let ofUpdateWithCmds
+            (runState: '``StateMonad<'State, LetterCmd<'Letter>>`` -> 'State -> LetterCmd<'Letter> * 'State)
             (stop: 'StopToken -> 'State -> #Job<'StoppedToken>)
             (init: unit -> #Job<'State>)
-            (update: NackOption -> 'Letter -> 'State -> 'State * LetterCmd<'Letter>)
+            (update: NackOption -> 'Letter -> _)
             =
             ofAgentFunc
             <| fun take send ->
@@ -107,17 +147,18 @@ module MailboxAgent =
                         match msg with
                         | Stop token -> stop token state |> asJob
                         | Letter (body, nackOption) ->
-                            let state', cmd = update nackOption body state
+                            let cmd, state' = runState (update nackOption body) state
 
                             LetterCmd.exec send cmd >>= fun () -> loop state'
 
                 init () >>= loop
 
         let ofUpdateWithIntents
+            (runState: '``StateMonad<'State, 'Intent list>`` -> 'State -> 'Intent list * 'State)
             (stop: 'StopToken -> 'State -> #Job<'StoppedToken>)
             (init: unit -> #Job<'State>)
-            (update: NackOption -> 'Letter -> 'State -> 'State * 'Intent list)
-            mapIntents
+            (update: NackOption -> 'Letter -> _)
+            mapIntent
             =
             ofAgentFunc
             <| fun take send ->
@@ -127,55 +168,12 @@ module MailboxAgent =
                         match msg with
                         | Stop token -> stop token state |> asJob
                         | Letter (body, nackOption) ->
-                            let state', intents = update nackOption body state
+                            let intents, state' = runState (update nackOption body) state
 
-                            intents |> Seq.map mapIntents |> LetterCmd.batch |> LetterCmd.exec send
+                            intents |> Seq.map mapIntent |> LetterCmd.batch |> LetterCmd.exec send
                             >>=. loop state'
 
                 init () >>= loop
-
-        module State =
-            let ofUpdateWithCmds
-                (runState: '``StateMonad<'State, LetterCmd<'Letter>>`` -> 'State -> LetterCmd<'Letter> * 'State)
-                (stop: 'StopToken -> 'State -> #Job<'StoppedToken>)
-                (init: unit -> #Job<'State>)
-                (update: NackOption -> 'Letter -> _)
-                =
-                ofAgentFunc
-                <| fun take send ->
-                    let rec loop state =
-                        take ()
-                        >>= fun msg ->
-                            match msg with
-                            | Stop token -> stop token state |> asJob
-                            | Letter (body, nackOption) ->
-                                let cmd, state' = runState (update nackOption body) state
-
-                                LetterCmd.exec send cmd >>= fun () -> loop state'
-
-                    init () >>= loop
-
-            let ofUpdateWithIntents
-                (runState: '``StateMonad<'State, 'Intent list>`` -> 'State -> 'Intent list * 'State)
-                (stop: 'StopToken -> 'State -> #Job<'StoppedToken>)
-                (init: unit -> #Job<'State>)
-                (update: NackOption -> 'Letter -> _)
-                mapIntent
-                =
-                ofAgentFunc
-                <| fun take send ->
-                    let rec loop state =
-                        take ()
-                        >>= fun msg ->
-                            match msg with
-                            | Stop token -> stop token state |> asJob
-                            | Letter (body, nackOption) ->
-                                let intents, state' = runState (update nackOption body) state
-
-                                intents |> Seq.map mapIntent |> LetterCmd.batch |> LetterCmd.exec send
-                                >>=. loop state'
-
-                    init () >>= loop
 
     let trySend { Mailbox = mailbox; Stop = stop } msg =
         stop ^-> (Error << AgentStopping)
