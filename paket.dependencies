@@ -1,5 +1,9 @@
 source https://www.nuget.org/api/v2
 
 storage: none
+nuget Flux.Collections
 nuget FSharp.Core
 nuget Hopac
+nuget Expecto
+nuget Expecto.FsCheck
+nuget Expecto.Hopac
