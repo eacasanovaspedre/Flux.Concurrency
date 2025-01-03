@@ -308,18 +308,42 @@ module LoadingCache =
         |> MailboxAgent.ofAgentFun
         >>- LoadingCache
 
-    type ErrorFinding<'StoppedToken, 'StopToken, 'LoadingError> =
+    type CacheFindError<'StoppedToken, 'StopToken, 'LoadingError> =
         | CacheStopping of 'StopToken
         | CacheStopped of 'StoppedToken
         | CouldNotLoadValue of 'LoadingError
+        
+    exception CacheFindException of Error: CacheFindError<obj, obj, obj>
 
-    let maybeFind key (LoadingCache mailboxAgent) =
+    [<RequireQualifiedAccess>]
+    module Try =
+        let find key (LoadingCache mailboxAgent) =
+            MailboxAgent.Try.sendAndAwaitReply mailboxAgent (fun replyIVar -> Job.result (FindAndReply (key, replyIVar)))
+            ^-> function
+                | Ok (Ok value) -> Ok value
+                | Ok (Error error) -> Error (CouldNotLoadValue error)
+                | Error (MailboxAgent.AgentStopped token) -> Error (CacheStopped token)
+                | Error (MailboxAgent.AgentStopping token) -> Error (CacheStopping token)
+                
+    let find key (LoadingCache mailboxAgent) =
         MailboxAgent.Try.sendAndAwaitReply mailboxAgent (fun replyIVar -> Job.result (FindAndReply (key, replyIVar)))
         ^-> function
-            | Ok (Ok value) -> Ok value
-            | Ok (Error error) -> Error (CouldNotLoadValue error)
-            | Error (MailboxAgent.AgentStopped token) -> Error (CacheStopped token)
-            | Error (MailboxAgent.AgentStopping token) -> Error (CacheStopping token)
+            | Ok (Ok value) -> value
+            | Ok (Error error) -> raise (CacheFindException (CouldNotLoadValue error))
+            | Error (MailboxAgent.AgentStopped token) -> raise (CacheFindException (CacheStopped token))
+            | Error (MailboxAgent.AgentStopping token) -> raise (CacheFindException (CacheStopping token))
+            
+    let sendStop token (LoadingCache mailboxAgent) =
+        MailboxAgent.sendStop mailboxAgent token
+        
+    let sendStopAndAwait token (LoadingCache mailboxAgent) =
+        MailboxAgent.sendStopAndAwait mailboxAgent token
+        
+    let stopping (LoadingCache mailboxAgent) =
+        MailboxAgent.stopping mailboxAgent
+        
+    let stopped (LoadingCache mailboxAgent) =
+        MailboxAgent.stopped mailboxAgent
 
     type Builder() =
         member inline x.Yield(_: unit) = ()
@@ -398,18 +422,3 @@ module LoadingCache =
 module LoadingCache' =
 
     let loadingCache = LoadingCache.Builder ()
-
-    let abc () =
-        loadingCache {
-            expireIfNotReadFor (TimeSpan.FromSeconds 10)
-            refreshIfOlderThan (TimeSpan.FromSeconds 20) LoadingCache.KeepItem
-            withTimeOut timeOut
-
-            loadWith (fun key ->
-                Job.Random.get ()
-                >>= fun x -> max (float x / float Int64.MaxValue) 1. * 1500. |> int |> timeOutMillis
-                >>-. if key % 5 = 0 then
-                         Error $"Whatever {key}"
-                     else
-                         Ok $"Value for {key}")
-        }

@@ -47,7 +47,7 @@ let properties =
                   let! cache = loadingCache { loadWith f }
                   let! expected = f key >>- Result.mapError LoadingCache.CouldNotLoadValue
 
-                  let! result = LoadingCache.maybeFind key cache
+                  let! result = LoadingCache.Try.find key cache
                   result == expected
               }
               |> Job.toAsync
@@ -62,7 +62,7 @@ let properties =
                   let expected = f key |> Ok
 
                   let! finds =
-                      Seq.init 10 (fun _ -> LoadingCache.maybeFind key cache)
+                      Seq.init 10 (fun _ -> LoadingCache.Try.find key cache)
                       |> Job.conCollect
                       |> Promise.start
 
