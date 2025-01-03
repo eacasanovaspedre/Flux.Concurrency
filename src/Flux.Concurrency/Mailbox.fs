@@ -68,26 +68,28 @@ type nack = Nack
 type MailboxAgent<'Letter, 'StoppedToken, 'StopToken> =
     private
         { Mailbox: Mailbox<'Letter>
-          Stopped: 'StoppedToken Alt
+          Stopped: 'StoppedToken Promise
           Stop: 'StopToken IVar }
-        
-type MailboxMessage<'Letter, 'StopToken> =
+
+type MailboxPackage<'Letter, 'StopToken> =
     | Stop of 'StopToken
     | Envelope of 'Letter
 
 module MailboxAgent =
 
-    type CouldNotSendLetter<'StopToken> = AgentStopping of 'StopToken
+    type CouldNotSendLetter<'StoppedToken, 'StopToken> =
+        | AgentStopping of 'StopToken
+        | AgentStopped of 'StoppedToken
 
-    exception CouldNotSendLetterException of Error: obj CouldNotSendLetter
+    exception CouldNotSendLetterException of Error: CouldNotSendLetter<obj, obj>
 
     let ofAgentFun agent : MailboxAgent<'Envelope, 'StoppedToken, 'StopToken> Job =
         let mailbox = Mailbox ()
         let stopIVar = IVar ()
-        let inline takeMsg () = stopIVar ^-> Stop <|> Mailbox.take mailbox ^-> Envelope
-        let inline sendMsg msg = Mailbox.send mailbox msg
+        let inline receiveLetter () = stopIVar ^-> Stop <|> Mailbox.take mailbox ^-> Envelope
+        let inline sendLetter msg = Mailbox.send mailbox msg
 
-        (takeMsg, sendMsg) ||> agent |> Promise.start
+        (receiveLetter, sendLetter) ||> agent |> Promise.start
         >>- fun stopped ->
             { Mailbox = mailbox
               Stopped = stopped
@@ -177,28 +179,50 @@ module MailboxAgent =
 
     [<RequireQualifiedAccess>]
     module Try =
-        let send { Mailbox = mailbox; Stop = stop } letter =
-            stop ^-> (Error << AgentStopping)
-            <|> Alt.prepare (mailbox *<<+ letter >>-. Alt.always (Ok ()))
-            |> asJob
+        let send
+            { Mailbox = mailbox
+              Stopped = stopped
+              Stop = stop }
+            letter
+            =
+            Alt.choosy
+                [| stopped ^-> (Error << AgentStopped)
+                   stop ^-> (Error << AgentStopping)
+                   Alt.prepare (mailbox *<<+ letter >>-. Alt.always (Ok ())) |]
 
-        let sendAndAwaitReply { Mailbox = mailbox; Stop = stop } letterJobBuilder =
-            stop ^-> (Error << AgentStopping)
-            <|> Alt.prepareJob (fun () ->
-                let replyIVar = IVar ()
+        let sendAndAwaitReply
+            { Mailbox = mailbox
+              Stopped = stopped
+              Stop = stop }
+            letterJobBuilder
+            =
+            Alt.choosy
+                [| stopped ^-> (Error << AgentStopped)
+                   stop ^-> (Error << AgentStopping)
+                   Alt.prepareJob
+                   <| fun () ->
+                       let replyIVar = IVar ()
 
-                letterJobBuilder replyIVar
-                >>= fun letter -> mailbox *<<+ letter >>-. replyIVar ^-> Ok)
+                       letterJobBuilder replyIVar
+                       >>= fun letter -> mailbox *<<+ letter >>-. replyIVar ^-> Ok |]
 
         [<RequireQualifiedAccess>]
         module WithNack =
-            let sendAndAwaitReply { Mailbox = mailbox; Stop = stop } letterJobBuilder =
-                stop ^-> (Error << AgentStopping)
-                <|> Alt.withNackJob (fun nack ->
-                    let replyCh = Ch ()
+            let sendAndAwaitReply
+                { Mailbox = mailbox
+                  Stopped = stopped
+                  Stop = stop }
+                letterJobBuilder
+                =
+                Alt.choosy
+                    [| stopped ^-> (Error << AgentStopped)
+                       stop ^-> (Error << AgentStopping)
+                       Alt.withNackJob
+                       <| fun nack ->
+                           let replyCh = Ch ()
 
-                    letterJobBuilder replyCh nack
-                    >>= fun letter -> mailbox *<<+ letter >>-. replyCh ^-> Ok)
+                           letterJobBuilder replyCh nack
+                           >>= fun letter -> mailbox *<<+ letter >>-. replyCh ^-> Ok |]
 
     [<RequireQualifiedAccess>]
     module WithNack =
@@ -206,20 +230,37 @@ module MailboxAgent =
             Try.WithNack.sendAndAwaitReply mailboxAgent letterJobBuilder
             ^=> function
                 | Ok x -> Job.result x
-                | Error (AgentStopping token) ->
-                    token |> box |> AgentStopping |> CouldNotSendLetterException |> Job.raises
+                | Error error ->
+                    match error with
+                    | AgentStopping token -> token |> box
+                    | AgentStopped token -> token |> box
+                    |> AgentStopping
+                    |> CouldNotSendLetterException
+                    |> Job.raises
 
     let send mailboxAgent msg =
         Try.send mailboxAgent msg
         >>= function
             | Ok _ -> Job.unit ()
-            | Error (AgentStopping token) -> token |> box |> AgentStopping |> CouldNotSendLetterException |> Job.raises
+            | Error error ->
+                match error with
+                | AgentStopping token -> token |> box
+                | AgentStopped token -> token |> box
+                |> AgentStopping
+                |> CouldNotSendLetterException
+                |> Job.raises
 
     let sendAndAwaitReply mailboxAgent msgBuilder =
         Try.sendAndAwaitReply mailboxAgent msgBuilder
         ^=> function
             | Ok x -> Job.result x
-            | Error (AgentStopping token) -> token |> box |> AgentStopping |> CouldNotSendLetterException |> Job.raises
+            | Error error ->
+                match error with
+                | AgentStopping token -> token |> box
+                | AgentStopped token -> token |> box
+                |> AgentStopping
+                |> CouldNotSendLetterException
+                |> Job.raises
 
     let sendStop { Stop = stop } v = IVar.tryFill stop v
 

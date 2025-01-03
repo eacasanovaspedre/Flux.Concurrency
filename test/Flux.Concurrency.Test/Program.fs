@@ -8,12 +8,12 @@ open Expecto.Tests
 
 [<EntryPoint>]
 let main argv =
-    let logary =
-        Config.create "MyProject.Tests" "localhost"
-        |> Config.targets [ LiterateConsole.create LiterateConsole.empty "console" ]
-        |> Config.processing (Events.events |> Events.sink ["console";])
-        |> Config.build
-        |> run
-    LogaryFacadeAdapter.initialise<Expecto.Logging.Logger> logary
+    // let logary =
+    //     Config.create "MyProject.Tests" "localhost"
+    //     |> Config.targets [ LiterateConsole.create LiterateConsole.empty "console" ]
+    //     |> Config.processing (Events.events |> Events.sink ["console";])
+    //     |> Config.build
+    //     |> run
+    // LogaryFacadeAdapter.initialise<Expecto.Logging.Logger> logary
 
     runTestsInAssemblyWithCLIArgs [] argv

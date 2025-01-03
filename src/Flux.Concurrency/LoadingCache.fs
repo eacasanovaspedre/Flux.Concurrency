@@ -38,9 +38,12 @@ module LoadingCache =
         | NoUsagePolicy
         | ExpireIfNotReadFor of TimeSpan
 
+    type TimeOut = internal TimeOut of (TimeSpan -> Alt<unit>)
+
     type Config =
         { ItemAgePolicy: ItemAgePolicy
-          ItemUsagePolicy: ItemUsagePolicy }
+          ItemUsagePolicy: ItemUsagePolicy
+          TimeOut: TimeOut }
 
     module RefreshFailurePolicy =
         let default' = ExpireItem
@@ -51,16 +54,17 @@ module LoadingCache =
     module ItemUsagePolicy =
         let default' = NoUsagePolicy
 
+    module TimeOut =
+        let default' = TimeOut timeOut
+
     module Config =
         let default' =
             { ItemAgePolicy = ItemAgePolicy.default'
-              ItemUsagePolicy = ItemUsagePolicy.default' }
+              ItemUsagePolicy = ItemUsagePolicy.default'
+              TimeOut = TimeOut.default' }
 
     [<AutoOpen>]
     module private Impl =
-        let trace str =
-            let dt = DateTime.Now
-            printfn $"{dt.Minute}:{dt.Second}:{dt.Millisecond} => %s{str}"
 
         type Item<'Value, 'Error> =
             | Cached of Cached<'Value>
@@ -77,6 +81,7 @@ module LoadingCache =
                 >>-. newCancellation
 
             let private runJobAfterTimeoutWithCancellation
+                waitFor
                 timeToWaitBeforeRunningJob
                 currentCancellationMVarOption
                 commit
@@ -89,7 +94,7 @@ module LoadingCache =
 
                 let startRunJobOnTimeout newCancellation =
                     newCancellation ^->. Job.unit ()
-                    <|> timeOut timeToWaitBeforeRunningJob ^->. (asAlt commit >>=. job)
+                    <|> waitFor timeToWaitBeforeRunningJob ^->. (asAlt commit >>=. job)
                     >>= id
                     |> Job.start
                     >>-. newCancellation
@@ -98,25 +103,33 @@ module LoadingCache =
 
             module ItemUsage =
 
-                let inline private setUpExpirationIfNotReadFor timeToExpire sendMsg currentCancellationMVar commit key =
-                    runJobAfterTimeoutWithCancellation timeToExpire currentCancellationMVar commit
+                let inline private setUpExpirationIfNotReadFor
+                    waitFor
+                    timeToExpire
+                    sendMsg
+                    currentCancellationMVar
+                    commit
+                    key
+                    =
+                    runJobAfterTimeoutWithCancellation waitFor timeToExpire currentCancellationMVar commit
                     <| sendMsg (ExpireInactiveItem key)
 
-                let runItemUsagePolicy itemUsagePolicy currentCancellation sendMsg commit key =
+                let runItemUsagePolicy waitFor itemUsagePolicy currentCancellation sendMsg commit key =
                     match itemUsagePolicy, currentCancellation with
                     | ExpireIfNotReadFor timeToWait, currentCancellationMVarOpt ->
-                        setUpExpirationIfNotReadFor timeToWait sendMsg currentCancellationMVarOpt commit key
+                        setUpExpirationIfNotReadFor waitFor timeToWait sendMsg currentCancellationMVarOpt commit key
                         >>- Some
                     | NoUsagePolicy, None -> Job.result None
                     | NoUsagePolicy, Some _ -> failwith "ERROR"
 
             module ItemAge =
 
-                let inline private setUpAgeExpiration timeToExpire sendMsg commit key =
-                    runJobAfterTimeoutWithCancellation timeToExpire None commit
+                let inline private setUpAgeExpiration waitFor timeToExpire sendMsg commit key =
+                    runJobAfterTimeoutWithCancellation waitFor timeToExpire None commit
                     <| sendMsg (ExpireOldItem key)
 
                 let rec private setUpAutoRefresh
+                    waitFor
                     tryLoadFromSource
                     timeToRefresh
                     refreshFailurePolicy
@@ -131,47 +144,51 @@ module LoadingCache =
                             | Ok value, _ ->
                                 let commit = IVar ()
 
-                                setUpAutoRefresh tryLoadFromSource timeToRefresh refreshFailurePolicy sendMsg commit key
+                                setUpAutoRefresh
+                                    waitFor
+                                    tryLoadFromSource
+                                    timeToRefresh
+                                    refreshFailurePolicy
+                                    sendMsg
+                                    commit
+                                    key
                                 >>= fun agePolicyCancellation ->
                                     Replace (key, value, agePolicyCancellation) |> sendMsg >>=. IVar.fill commit ()
                             | Error _, ExpireItem -> ExpireOldItem key |> sendMsg
                             | Error _, KeepItem -> Job.unit ()
 
-                    runJobAfterTimeoutWithCancellation timeToRefresh None commit refreshJob
+                    runJobAfterTimeoutWithCancellation waitFor timeToRefresh None commit refreshJob
 
-                let runItemAgePolicy tryLoadFromSource itemAgePolicy sendMsg commit key =
+                let runItemAgePolicy waitFor tryLoadFromSource itemAgePolicy sendMsg commit key =
                     match itemAgePolicy with
                     | NoAgePolicy -> Job.result None
-                    | ExpireIfOlderThan timeToWait -> setUpAgeExpiration timeToWait sendMsg commit key >>- Some
+                    | ExpireIfOlderThan timeToWait -> setUpAgeExpiration waitFor timeToWait sendMsg commit key >>- Some
                     | RefreshIfOlderThan (timeToWait, refreshFailurePolicy) ->
-                        setUpAutoRefresh tryLoadFromSource timeToWait refreshFailurePolicy sendMsg commit key
+                        setUpAutoRefresh waitFor tryLoadFromSource timeToWait refreshFailurePolicy sendMsg commit key
                         >>- Some
 
-        let findAndReply itemUsagePolicy sendMsg key replyIVar map =
+        let findAndReply waitFor itemUsagePolicy sendMsg key replyIVar map =
             Job.thunk <| fun _ -> HamtMap.maybeFind key map
             >>= function
                 | Some (Cached { Value = value
                                  UsagePolicyCancellation = usagePolicyCancellation }) ->
                     replyIVar *<= Ok value
                     >>=. Policy.ItemUsage.runItemUsagePolicy
+                        waitFor
                         itemUsagePolicy
                         usagePolicyCancellation
                         sendMsg
                         (Alt.unit ())
                         key
                     |> Job.Ignore
-                | Some (Loading originalReplyIVar) ->
-                    trace $"Key {key} found loading, attaching to result"
-                    originalReplyIVar >>= ( *<= ) replyIVar
+                | Some (Loading originalReplyIVar) -> originalReplyIVar >>= ( *<= ) replyIVar
                 | None -> sendMsg (LoadAndReply (key, replyIVar))
             |> Job.start
             >>-. map
 
-        let loadAndReply tryLoadFromSource itemUsagePolicy itemAgePolicy sendMsg key replyIVar map =
+        let loadAndReply waitFor tryLoadFromSource itemUsagePolicy itemAgePolicy sendMsg key replyIVar map =
             match HamtMap.maybeFind key map with
-            | Some (Loading originalReplyIVar) ->
-                trace $"Key {key} found loading, attaching to result"
-                originalReplyIVar >>= ( *<= ) replyIVar |> Job.start >>-. map
+            | Some (Loading originalReplyIVar) -> originalReplyIVar >>= ( *<= ) replyIVar |> Job.start >>-. map
             | None ->
                 tryLoadFromSource key
                 >>= fun result -> replyIVar *<= result >>-. result
@@ -179,8 +196,8 @@ module LoadingCache =
                     | Ok value ->
                         let commit = IVar ()
 
-                        Policy.ItemUsage.runItemUsagePolicy itemUsagePolicy None sendMsg commit key
-                        <*> Policy.ItemAge.runItemAgePolicy tryLoadFromSource itemAgePolicy sendMsg commit key
+                        Policy.ItemUsage.runItemUsagePolicy waitFor itemUsagePolicy None sendMsg commit key
+                        <*> Policy.ItemAge.runItemAgePolicy waitFor tryLoadFromSource itemAgePolicy sendMsg commit key
                         >>= fun (usagePolicyCancellation, agePolicyCancellation) ->
                             let cached =
                                 { Value = value
@@ -252,19 +269,25 @@ module LoadingCache =
                 | _ -> failwith "ERROR"
             <| map
 
-        let agentFun itemAgePolicy itemUsagePolicy tryLoadFromSource takeMsg sendMsg =
+        let agentFun waitFor itemAgePolicy itemUsagePolicy tryLoadFromSource receiveLetter sendLetter =
             let rec loop map =
-                takeMsg ()
+                receiveLetter ()
                 >>= function
                     | Stop stopToken -> Job.result stopToken
                     | Envelope letter ->
-                        trace $"Mailbox received %A{letter} with map %A{map}"
-
                         match letter with
                         | FindAndReply (key, replyIVar) ->
-                            findAndReply itemUsagePolicy sendMsg key replyIVar map >>= loop
+                            findAndReply waitFor itemUsagePolicy sendLetter key replyIVar map >>= loop
                         | LoadAndReply (key, replyIVar) ->
-                            loadAndReply tryLoadFromSource itemUsagePolicy itemAgePolicy sendMsg key replyIVar map
+                            loadAndReply
+                                waitFor
+                                tryLoadFromSource
+                                itemUsagePolicy
+                                itemAgePolicy
+                                sendLetter
+                                key
+                                replyIVar
+                                map
                             >>= loop
                         | Cache (key, cached) -> cache key cached map |> loop
                         | ResetKeyAfterLoadFailed key -> loadFailedAndReply key map |> loop
@@ -277,82 +300,116 @@ module LoadingCache =
 
     let create
         { ItemAgePolicy = itemAgePolicy
-          ItemUsagePolicy = itemUsagePolicy }
+          ItemUsagePolicy = itemUsagePolicy
+          TimeOut = TimeOut waitFor }
         tryLoadFromSource
         =
-        agentFun itemAgePolicy itemUsagePolicy tryLoadFromSource
+        agentFun waitFor itemAgePolicy itemUsagePolicy tryLoadFromSource
         |> MailboxAgent.ofAgentFun
         >>- LoadingCache
 
+    type ErrorFinding<'StoppedToken, 'StopToken, 'LoadingError> =
+        | CacheStopping of 'StopToken
+        | CacheStopped of 'StoppedToken
+        | CouldNotLoadValue of 'LoadingError
+
     let maybeFind key (LoadingCache mailboxAgent) =
         MailboxAgent.Try.sendAndAwaitReply mailboxAgent (fun replyIVar -> Job.result (FindAndReply (key, replyIVar)))
+        ^-> function
+            | Ok (Ok value) -> Ok value
+            | Ok (Error error) -> Error (CouldNotLoadValue error)
+            | Error (MailboxAgent.AgentStopped token) -> Error (CacheStopped token)
+            | Error (MailboxAgent.AgentStopping token) -> Error (CacheStopping token)
 
-    module Builder =
-        type LoadingCacheBuilder() =
-            member inline x.Yield(_: unit) = ()
+    type Builder() =
+        member inline x.Yield(_: unit) = ()
 
-            [<CustomOperation "expireIfOlderThan">]
-            member inline x.ExpireIfOlderThan((), duration) = ExpireIfOlderThan duration
+        [<CustomOperation "expireIfOlderThan">]
+        member inline x.ExpireIfOlderThan((), duration) = ExpireIfOlderThan duration
 
-            [<CustomOperation "expireIfOlderThan">]
-            member inline x.ExpireIfOlderThan(current, duration) =
-                { ItemUsagePolicy = current
-                  ItemAgePolicy = ExpireIfOlderThan duration }
+        [<CustomOperation "expireIfOlderThan">]
+        member inline x.ExpireIfOlderThan(current, duration) =
+            { ItemUsagePolicy = current
+              ItemAgePolicy = ExpireIfOlderThan duration
+              TimeOut = TimeOut.default' }
 
-            [<CustomOperation "refreshIfOlderThan">]
-            member inline x.RefreshIfOlderThan((), duration, expireIfFailedToRefresh) =
-                RefreshIfOlderThan (duration, expireIfFailedToRefresh)
+        [<CustomOperation "refreshIfOlderThan">]
+        member inline x.RefreshIfOlderThan((), duration, expireIfFailedToRefresh) =
+            RefreshIfOlderThan (duration, expireIfFailedToRefresh)
 
-            [<CustomOperation "refreshIfOlderThan">]
-            member inline x.RefreshIfOlderThan(current, duration, expireIfFailedToRefresh) =
-                { ItemUsagePolicy = current
-                  ItemAgePolicy = RefreshIfOlderThan (duration, expireIfFailedToRefresh) }
+        [<CustomOperation "refreshIfOlderThan">]
+        member inline x.RefreshIfOlderThan(current, duration, expireIfFailedToRefresh) =
+            { ItemUsagePolicy = current
+              ItemAgePolicy = RefreshIfOlderThan (duration, expireIfFailedToRefresh)
+              TimeOut = TimeOut.default' }
 
-            [<CustomOperation "expireIfNotReadFor">]
-            member inline x.ExpireIfNotReadFor((), duration) = ExpireIfNotReadFor duration
+        [<CustomOperation "expireIfNotReadFor">]
+        member inline x.ExpireIfNotReadFor((), duration) = ExpireIfNotReadFor duration
 
-            [<CustomOperation "expireIfNotReadFor">]
-            member inline x.ExpireIfNotReadFor(current, duration) =
-                { Config.ItemUsagePolicy = ExpireIfNotReadFor duration
-                  ItemAgePolicy = current }
+        [<CustomOperation "expireIfNotReadFor">]
+        member inline x.ExpireIfNotReadFor(current, duration) =
+            { ItemUsagePolicy = ExpireIfNotReadFor duration
+              ItemAgePolicy = current
+              TimeOut = TimeOut.default' }
 
-            [<CustomOperation "loadWith">]
-            member x.LoadWith((), f) =
-                create
-                    Config.default'
-                    f
+        [<CustomOperation "withTimeOut">]
+        member x.WithTimeOut((), f) =
+            { Config.default' with
+                TimeOut = TimeOut f }
 
-            [<CustomOperation "loadWith">]
-            member x.LoadWith(final, f) =
-                create
-                    { ItemUsagePolicy = ItemUsagePolicy.default'
-                      ItemAgePolicy = final }
-                    f
+        [<CustomOperation "withTimeOut">]
+        member x.WithTimeOut(current, f) =
+            { ItemUsagePolicy = current
+              ItemAgePolicy = ItemAgePolicy.default'
+              TimeOut = TimeOut f }
 
-            [<CustomOperation "loadWith">]
-            member x.LoadWith(final, f) =
-                create
-                    { ItemUsagePolicy = final
-                      ItemAgePolicy = ItemAgePolicy.default' }
-                    f
+        [<CustomOperation "withTimeOut">]
+        member x.WithTimeOut(current, f) =
+            { ItemUsagePolicy = ItemUsagePolicy.default'
+              ItemAgePolicy = current
+              TimeOut = TimeOut f }
 
-            [<CustomOperation "loadWith">]
-            member x.LoadWith(final, f) = create final f
+        [<CustomOperation "withTimeOut">]
+        member x.WithTimeOut(current, f) = { current with TimeOut = TimeOut f }
 
-        let loadingCache = LoadingCacheBuilder ()
+        [<CustomOperation "loadWith">]
+        member x.LoadWith((), f) = create Config.default' f
 
-        let abc () =
-            loadingCache {
-                expireIfNotReadFor (TimeSpan.FromSeconds 10)
-                refreshIfOlderThan (TimeSpan.FromSeconds 20) KeepItem
+        [<CustomOperation "loadWith">]
+        member x.LoadWith(final, f) =
+            create
+                { ItemUsagePolicy = ItemUsagePolicy.default'
+                  ItemAgePolicy = final
+                  TimeOut = TimeOut.default' }
+                f
 
-                loadWith (fun key ->
-                    trace $"Loading %d{key}"
+        [<CustomOperation "loadWith">]
+        member x.LoadWith(final, f) =
+            create
+                { ItemUsagePolicy = final
+                  ItemAgePolicy = ItemAgePolicy.default'
+                  TimeOut = TimeOut.default' }
+                f
 
-                    Job.Random.get ()
-                    >>= fun x -> max (float x / float Int64.MaxValue) 1. * 1500. |> int |> timeOutMillis
-                    >>-. if key % 5 = 0 then
-                             Error $"Whatever {key}"
-                         else
-                             Ok $"Value for {key}")
-            }
+        [<CustomOperation "loadWith">]
+        member x.LoadWith(final, f) = create final f
+
+[<AutoOpen>]
+module LoadingCache' =
+
+    let loadingCache = LoadingCache.Builder ()
+
+    let abc () =
+        loadingCache {
+            expireIfNotReadFor (TimeSpan.FromSeconds 10)
+            refreshIfOlderThan (TimeSpan.FromSeconds 20) LoadingCache.KeepItem
+            withTimeOut timeOut
+
+            loadWith (fun key ->
+                Job.Random.get ()
+                >>= fun x -> max (float x / float Int64.MaxValue) 1. * 1500. |> int |> timeOutMillis
+                >>-. if key % 5 = 0 then
+                         Error $"Whatever {key}"
+                     else
+                         Ok $"Value for {key}")
+        }
