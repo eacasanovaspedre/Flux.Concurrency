@@ -11,6 +11,10 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Mailbox.fs" />
+    <Compile Include="LoadingCache.fs" />
   </ItemGroup>
-  <Import Project="..\..\.paket\Paket.Restore.targets" />
+  <ItemGroup>
+    <PackageReference Include="Flux.Collections" Version="1.4.1-alpha" />
+    <PackageReference Include="Hopac" Version="0.5.1" />
+  </ItemGroup>
 </Project>
