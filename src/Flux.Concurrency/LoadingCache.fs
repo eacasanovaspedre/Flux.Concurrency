@@ -234,7 +234,8 @@ module LoadingCache =
                         let cancelAgePolicy = IVar.tryFill agePolicyCancellation ()
 
                         cancelUsagePolicy <*> cancelAgePolicy >>-. HamtMap.remove key map
-            | _ -> failwith "ERROR"
+            | Some _
+            | None -> Job.result map
 
         let expireInactiveItem key map =
             match HamtMap.maybeFind key map with
@@ -254,7 +255,8 @@ module LoadingCache =
                             let cancelUsagePolicy = IVar.tryFill usagePolicyCancellation ()
 
                             cancelUsagePolicy <*> cancelAgePolicy >>-. HamtMap.remove key map
-            | _ -> failwith "ERROR"
+            | Some _
+            | None -> Job.result map
 
         let replace key value agePolicyCancellation map =
             HamtMap.change key
@@ -266,7 +268,8 @@ module LoadingCache =
                                 Value = value
                                 AgePolicyCancellation = Some agePolicyCancellation }
                     )
-                | _ -> failwith "ERROR"
+                | Some x -> Some x
+                | None -> None
             <| map
 
         let agentFun waitFor itemAgePolicy itemUsagePolicy tryLoadFromSource receiveLetter sendLetter =
@@ -312,19 +315,20 @@ module LoadingCache =
         | CacheStopping of 'StopToken
         | CacheStopped of 'StoppedToken
         | CouldNotLoadValue of 'LoadingError
-        
+
     exception CacheFindException of Error: CacheFindError<obj, obj, obj>
 
     [<RequireQualifiedAccess>]
     module Try =
         let find key (LoadingCache mailboxAgent) =
-            MailboxAgent.Try.sendAndAwaitReply mailboxAgent (fun replyIVar -> Job.result (FindAndReply (key, replyIVar)))
+            MailboxAgent.Try.sendAndAwaitReply mailboxAgent (fun replyIVar ->
+                Job.result (FindAndReply (key, replyIVar)))
             ^-> function
                 | Ok (Ok value) -> Ok value
                 | Ok (Error error) -> Error (CouldNotLoadValue error)
                 | Error (MailboxAgent.AgentStopped token) -> Error (CacheStopped token)
                 | Error (MailboxAgent.AgentStopping token) -> Error (CacheStopping token)
-                
+
     let find key (LoadingCache mailboxAgent) =
         MailboxAgent.Try.sendAndAwaitReply mailboxAgent (fun replyIVar -> Job.result (FindAndReply (key, replyIVar)))
         ^-> function
@@ -332,18 +336,14 @@ module LoadingCache =
             | Ok (Error error) -> raise (CacheFindException (CouldNotLoadValue error))
             | Error (MailboxAgent.AgentStopped token) -> raise (CacheFindException (CacheStopped token))
             | Error (MailboxAgent.AgentStopping token) -> raise (CacheFindException (CacheStopping token))
-            
-    let sendStop token (LoadingCache mailboxAgent) =
-        MailboxAgent.sendStop mailboxAgent token
-        
-    let sendStopAndAwait token (LoadingCache mailboxAgent) =
-        MailboxAgent.sendStopAndAwait mailboxAgent token
-        
-    let stopping (LoadingCache mailboxAgent) =
-        MailboxAgent.stopping mailboxAgent
-        
-    let stopped (LoadingCache mailboxAgent) =
-        MailboxAgent.stopped mailboxAgent
+
+    let sendStop token (LoadingCache mailboxAgent) = MailboxAgent.sendStop mailboxAgent token
+
+    let sendStopAndAwait token (LoadingCache mailboxAgent) = MailboxAgent.sendStopAndAwait mailboxAgent token
+
+    let stopping (LoadingCache mailboxAgent) = MailboxAgent.stopping mailboxAgent
+
+    let stopped (LoadingCache mailboxAgent) = MailboxAgent.stopped mailboxAgent
 
     type Builder() =
         member inline x.Yield(_: unit) = ()
@@ -377,24 +377,24 @@ module LoadingCache =
               TimeOut = TimeOut.default' }
 
         [<CustomOperation "withTimeOut">]
-        member x.WithTimeOut((), f) =
+        member internal x.WithTimeOut((), f) =
             { Config.default' with
                 TimeOut = TimeOut f }
 
         [<CustomOperation "withTimeOut">]
-        member x.WithTimeOut(current, f) =
+        member internal x.WithTimeOut(current, f) =
             { ItemUsagePolicy = current
               ItemAgePolicy = ItemAgePolicy.default'
               TimeOut = TimeOut f }
 
         [<CustomOperation "withTimeOut">]
-        member x.WithTimeOut(current, f) =
+        member internal x.WithTimeOut(current, f) =
             { ItemUsagePolicy = ItemUsagePolicy.default'
               ItemAgePolicy = current
               TimeOut = TimeOut f }
 
         [<CustomOperation "withTimeOut">]
-        member x.WithTimeOut(current, f) = { current with TimeOut = TimeOut f }
+        member internal x.WithTimeOut(current, f) = { current with TimeOut = TimeOut f }
 
         [<CustomOperation "loadWith">]
         member x.LoadWith((), f) = create Config.default' f
